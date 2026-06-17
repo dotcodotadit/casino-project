@@ -1,0 +1,16 @@
+# Keep the Docker build context small & deterministic.
+**/node_modules
+**/dist
+**/.turbo
+**/.vite
+**/coverage
+**/*.log
+.git
+.github
+.vscode
+.idea
+**/.env
+**/.env.*
+!**/.env.example
+deployment/certs
+**/.DS_Store

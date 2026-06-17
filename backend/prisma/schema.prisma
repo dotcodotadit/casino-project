@@ -1,0 +1,1107 @@
+// Casino Clone — Prisma schema (demo / educational; provably-fair simulation, no real money)
+// Run: npx prisma migrate dev --name init   (after setting DATABASE_URL)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ──────────────────────────────────────────────
+// Users & auth
+// ──────────────────────────────────────────────
+
+enum UserRole {
+  PLAYER
+  ADMIN
+  SUPPORT
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  BANNED
+  SELF_EXCLUDED
+}
+
+enum KycLevel {
+  NONE // can browse + deposit small
+  BASIC // email + phone verified
+  FULL // identity verified — withdrawals enabled
+}
+
+enum KycStatus {
+  NONE
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+model User {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  phone        String?    @unique
+  username     String     @unique
+  passwordHash String
+  role         UserRole   @default(PLAYER)
+  status       UserStatus @default(ACTIVE)
+
+  emailVerified Boolean @default(false)
+  phoneVerified Boolean @default(false)
+
+  kycLevel KycLevel @default(NONE)
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  lastLoginAt DateTime?
+
+  wallets      Wallet[]
+  transactions Transaction[]
+  sessions     Session[]
+  kyc          KycRecord?
+  gameRounds   GameRound[]
+  otpCodes     OtpCode[]
+  clientSeeds  ClientSeed[]
+  auditLogs    AuditLog[]
+
+  aggregatorSessions   AggregatorSession[]
+  providerTransactions ProviderTransaction[]
+
+  userBonuses     UserBonus[]
+  freeSpinAwards  FreeSpinAward[]
+  bonusAbuseFlags BonusAbuseFlag[]
+
+  vipProgress      VipProgress?
+  loyaltyPointTxns LoyaltyPointTransaction[]
+  userMissions     UserMission[]
+  redemptions      RedemptionHistory[]
+
+  @@index([status])
+  @@index([role])
+}
+
+// Email/phone OTP verification (simulation)
+enum OtpChannel {
+  EMAIL
+  PHONE
+}
+
+model OtpCode {
+  id        String     @id @default(cuid())
+  userId    String
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel   OtpChannel
+  codeHash  String // hashed OTP, never store plaintext
+  expiresAt DateTime
+  consumed  Boolean    @default(false)
+  attempts  Int        @default(0)
+  createdAt DateTime   @default(now())
+
+  @@index([userId, channel])
+}
+
+// Refresh-token sessions with rotation + reuse detection
+model Session {
+  id                String    @id @default(cuid())
+  userId            String
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Hash of the refresh token (never store the raw token)
+  refreshTokenHash  String    @unique
+  // Rotation family — all tokens descended from one login share this id
+  familyId          String
+  // Simple device fingerprint (hash of UA + ip + accept headers)
+  deviceFingerprint String?
+  userAgent         String?
+  ipAddress         String?
+  expiresAt         DateTime
+  // Set when rotated; if a revoked token is reused -> breach -> kill family
+  revokedAt         DateTime?
+  replacedById      String?
+  createdAt         DateTime  @default(now())
+
+  @@index([userId])
+  @@index([familyId])
+}
+
+// ──────────────────────────────────────────────
+// KYC
+// ──────────────────────────────────────────────
+
+model KycRecord {
+  id              String    @id @default(cuid())
+  userId          String    @unique
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  level           KycLevel  @default(NONE)
+  status          KycStatus @default(NONE)
+  fullName        String?
+  documentId      String? // simulated — not a real document store
+  country         String?
+  dateOfBirth     DateTime?
+  reviewedAt      DateTime?
+  rejectionReason String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+}
+
+// ──────────────────────────────────────────────
+// Wallet & ledger
+// ──────────────────────────────────────────────
+
+enum WalletType {
+  MAIN
+  BONUS
+  CRYPTO
+}
+
+enum Currency {
+  USD
+  BTC
+  ETH
+  USDT
+}
+
+model Wallet {
+  id        String     @id @default(cuid())
+  userId    String
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      WalletType
+  currency  Currency   @default(USD)
+  // Balance stored in MINOR units (integer) to avoid float drift.
+  // For crypto, "minor" = satoshi-like smallest unit per currency config.
+  balance   BigInt     @default(0)
+  // Optimistic-locking version — bumped on every balance mutation.
+  version   Int        @default(0)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  transactions Transaction[]
+
+  // One wallet per (user, type, currency)
+  @@unique([userId, type, currency])
+  @@index([userId])
+}
+
+enum TransactionType {
+  DEPOSIT
+  WITHDRAW
+  BET
+  PAYOUT
+  BONUS
+  TRANSFER_IN
+  TRANSFER_OUT
+  FEE
+  ADJUSTMENT
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum DepositMethod {
+  CRYPTO_BTC
+  CRYPTO_ETH
+  CRYPTO_USDT
+  BANK_TRANSFER
+}
+
+model Transaction {
+  id       String @id @default(cuid())
+  userId   String
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  walletId String
+  wallet   Wallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  type          TransactionType
+  status        TransactionStatus @default(PENDING)
+  // Signed amount in minor units (+credit / -debit) is derived; we store magnitude + direction
+  amount        BigInt
+  feeAmount     BigInt            @default(0)
+  balanceBefore BigInt
+  balanceAfter  BigInt
+
+  method    DepositMethod?
+  // Idempotency / external reference (e.g. fake tx hash)
+  reference String?        @unique
+  // Free-form JSON metadata (bet id, game type, crypto address, etc.)
+  metadata  Json?
+
+  gameRoundId String?
+  gameRound   GameRound? @relation(fields: [gameRoundId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([walletId])
+  @@index([type])
+  @@index([status])
+}
+
+// ──────────────────────────────────────────────
+// Games & provably-fair
+// ──────────────────────────────────────────────
+
+enum GameType {
+  SLOTS
+  ROULETTE
+  BLACKJACK
+}
+
+// Server seed lifecycle for provably-fair. Hash published before play,
+// raw seed revealed after rotation so players can verify history.
+model ServerSeed {
+  id        String    @id @default(cuid())
+  seed      String // revealed only after rotation
+  seedHash  String    @unique // sha256(seed), published up-front
+  active    Boolean   @default(true)
+  rotatedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  gameRounds GameRound[]
+}
+
+model ClientSeed {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  seed      String
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  gameRounds GameRound[]
+
+  @@index([userId])
+}
+
+model GameRound {
+  id     String   @id @default(cuid())
+  userId String
+  user   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  game   GameType
+  stake  BigInt
+  payout BigInt   @default(0)
+
+  // Provably-fair linkage
+  serverSeedId String
+  serverSeed   ServerSeed @relation(fields: [serverSeedId], references: [id])
+  clientSeedId String
+  clientSeed   ClientSeed @relation(fields: [clientSeedId], references: [id])
+  nonce        Int
+  // Full game outcome payload (reels, pockets, hands…)
+  outcome      Json
+  // Set once a round is terminally settled (payout credited). Guards against
+  // double-settlement of stateful games (blackjack hit/stand replays).
+  settledAt    DateTime?
+
+  createdAt DateTime @default(now())
+
+  transactions Transaction[]
+
+  // Provably-fair integrity: a (serverSeed, clientSeed, nonce) triple fully
+  // determines the outcome, so it must be unique — prevents outcome reuse even
+  // if the nonce-from-count read ever races.
+  @@unique([serverSeedId, clientSeedId, nonce])
+  @@index([userId, createdAt])
+  @@index([game])
+}
+
+// ──────────────────────────────────────────────
+// Ops / audit
+// ──────────────────────────────────────────────
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    String // e.g. "auth.login", "wallet.withdraw"
+  ipAddress String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+// ──────────────────────────────────────────────
+// Game Aggregator (third-party providers, seamless wallet)
+// ──────────────────────────────────────────────
+
+enum ProviderStatus {
+  ACTIVE
+  DISABLED
+  MAINTENANCE
+}
+
+enum GameCategory {
+  SLOTS
+  LIVE
+  TABLE
+  CRASH
+  FISHING
+  LOTTERY
+  OTHER
+}
+
+enum AggregatorSessionStatus {
+  ACTIVE
+  CLOSED
+  EXPIRED
+}
+
+enum ProviderTxType {
+  BET
+  WIN
+  REFUND
+  ROLLBACK
+  BONUS
+}
+
+enum ProviderTxStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  ROLLED_BACK
+}
+
+enum CallbackStatus {
+  RECEIVED
+  PROCESSED
+  REJECTED
+  FAILED
+}
+
+// A third-party game provider integrated via the aggregator layer.
+// Credentials are stored ENCRYPTED (AES-256-GCM); never in plaintext.
+model Provider {
+  id                  String         @id @default(cuid())
+  code                String         @unique // e.g. PGSOFT, PRAGMATIC, EVOLUTION, JILI
+  name                String
+  aggregator          String? // optional upstream aggregator (e.g. HUB88, SOFTSWISS)
+  status              ProviderStatus @default(ACTIVE)
+  // Encrypted credential blob (apiKey/secret/endpoint), opaque to the DB.
+  credentialsEnc      String?
+  supportedCurrencies String[]       @default(["USD"])
+  // CIDR/IP entries permitted to call our callbacks for this provider.
+  callbackIpWhitelist String[]       @default([])
+  rtpDefault          Float          @default(0.96)
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  games                Game[]
+  sessions             AggregatorSession[]
+  providerTransactions ProviderTransaction[]
+
+  @@index([status])
+}
+
+model Game {
+  id           String       @id @default(cuid())
+  providerId   String
+  provider     Provider     @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  externalId   String // provider's game id
+  name         String
+  category     GameCategory @default(SLOTS)
+  rtp          Float?
+  enabled      Boolean      @default(true)
+  maintenance  Boolean      @default(false)
+  thumbnailUrl String?
+  currencies   String[]     @default(["USD"])
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  sessions AggregatorSession[]
+
+  @@unique([providerId, externalId])
+  @@index([category])
+  @@index([enabled])
+}
+
+// A launch session: maps our user to a provider game via an opaque token.
+model AggregatorSession {
+  id         String                  @id @default(cuid())
+  userId     String
+  user       User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  providerId String
+  provider   Provider                @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  gameId     String?
+  game       Game?                   @relation(fields: [gameId], references: [id], onDelete: SetNull)
+  token      String                  @unique // presented by the provider on callbacks
+  launchUrl  String
+  currency   String                  @default("USD")
+  status     AggregatorSessionStatus @default(ACTIVE)
+  ipAddress  String?
+  expiresAt  DateTime
+  createdAt  DateTime                @default(now())
+  closedAt   DateTime?
+
+  providerTransactions ProviderTransaction[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+// Every money-moving callback from a provider, mapped to our internal ledger.
+// `idempotencyKey` makes replays safe (exactly-once balance effect).
+model ProviderTransaction {
+  id         String             @id @default(cuid())
+  userId     String
+  user       User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  providerId String
+  provider   Provider           @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  sessionId  String?
+  session    AggregatorSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  type           ProviderTxType
+  status         ProviderTxStatus @default(PENDING)
+  roundId        String? // provider round id (groups bet+win)
+  providerTxId   String // provider's unique transaction id
+  idempotencyKey String           @unique // `${providerCode}:${type}:${providerTxId}`
+  amountMinor    BigInt
+  currency       String           @default("USD")
+  balanceAfter   BigInt?
+  // Link to the internal ledger Transaction we created.
+  internalTxId   String?
+  raw            Json?
+  createdAt      DateTime         @default(now())
+
+  @@index([userId, createdAt])
+  @@index([providerId])
+  @@index([roundId])
+}
+
+// Progressive jackpot pools (optional; surfaced by some providers).
+model Jackpot {
+  id          String   @id @default(cuid())
+  providerId  String?
+  name        String
+  currency    String   @default("USD")
+  amountMinor BigInt   @default(0)
+  active      Boolean  @default(true)
+  updatedAt   DateTime @updatedAt
+}
+
+// Raw callback audit + retry bookkeeping.
+model CallbackLog {
+  id             String         @id @default(cuid())
+  providerCode   String
+  action         String // bet|win|refund|rollback|balance
+  ipAddress      String?
+  signatureValid Boolean        @default(false)
+  status         CallbackStatus @default(RECEIVED)
+  idempotencyKey String?
+  payload        Json
+  response       Json?
+  error          String?
+  attempts       Int            @default(1)
+  createdAt      DateTime       @default(now())
+
+  @@index([providerCode, createdAt])
+  @@index([status])
+}
+
+// ──────────────────────────────────────────────
+// Bonus Engine & Promotions
+// ──────────────────────────────────────────────
+
+// The category of a bonus. Drives which engine path issues/credits it.
+enum BonusKind {
+  WELCOME // first-ever deposit match (+ optional free spins)
+  DEPOSIT // generic deposit-match
+  RELOAD // recurring deposit match (daily/weekly)
+  FREE_SPIN // free-spin package
+  CASHBACK // loss/deposit based rebate
+  LOYALTY // points/tier reward
+  NO_DEPOSIT // free credit, no deposit required
+  MANUAL // admin-granted ad-hoc bonus
+}
+
+// How a bonus reward is computed.
+enum BonusRewardType {
+  PERCENTAGE // % of trigger amount, capped by maxAmountMinor
+  FIXED // flat fixed credit
+  FREE_SPINS // N spins at a fixed spin value
+}
+
+// How the bonus is granted to a player.
+enum BonusClaimMode {
+  AUTO // engine grants automatically on trigger
+  MANUAL // player must claim from the promotions page
+  CODE // player must enter a promo code
+}
+
+enum BonusStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  EXPIRED
+  ARCHIVED
+}
+
+// Lifecycle of a single player's claimed bonus.
+enum UserBonusStatus {
+  PENDING // granted, awaiting activation
+  ACTIVE // wagering in progress
+  COMPLETED // wagering met, funds released to MAIN
+  FORFEITED // player cancelled / switched bonus
+  EXPIRED // time limit elapsed
+  CANCELLED // admin/abuse cancellation
+}
+
+enum CashbackBasis {
+  NET_LOSS // % of (bets - wins) over the period
+  DEPOSIT // % of deposits over the period
+}
+
+enum PromotionStatus {
+  DRAFT
+  SCHEDULED
+  ACTIVE
+  ENDED
+  ARCHIVED
+}
+
+// A reusable, admin-configured bonus template. Rules live in structured columns
+// plus a flexible config Json so new bonus variants need no migration.
+model Bonus {
+  id          String          @id @default(cuid())
+  code        String?         @unique
+  name        String
+  description String?
+  kind        BonusKind
+  rewardType  BonusRewardType
+  claimMode   BonusClaimMode  @default(AUTO)
+  status      BonusStatus     @default(DRAFT)
+
+  percentage       Float?
+  fixedAmountMinor BigInt?
+  maxAmountMinor   BigInt?
+  minDepositMinor  BigInt?
+
+  freeSpinCount      Int?
+  freeSpinValueMinor BigInt?
+  freeSpinGameId     String?
+
+  wagerMultiplier      Float   @default(0)
+  wagerIncludesDeposit Boolean @default(false)
+  maxBetMinor          BigInt?
+  expiryHours          Int     @default(168)
+
+  cashbackBasis       CashbackBasis?
+  cashbackPeriodHours Int?
+
+  allowStacking Boolean @default(false)
+  priority      Int     @default(0)
+
+  maxClaimsPerUser Int  @default(1)
+  maxClaimsTotal   Int?
+
+  startsAt DateTime?
+  endsAt   DateTime?
+
+  config Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  createdBy String?
+
+  conditions  BonusCondition[]
+  userBonuses UserBonus[]
+  promotions  Promotion[]
+  auditLogs   BonusAuditLog[]
+
+  @@index([kind])
+  @@index([status])
+  @@index([claimMode])
+}
+
+enum BonusConditionType {
+  MIN_DEPOSIT
+  MIN_KYC_LEVEL
+  COUNTRY_ALLOW
+  COUNTRY_DENY
+  NEW_USERS_ONLY
+  FIRST_DEPOSIT_ONLY
+  MIN_ACCOUNT_AGE_HOURS
+  GAME_CATEGORY
+  CUSTOM
+}
+
+// A single eligibility rule for a bonus, evaluated by conditions.service.
+model BonusCondition {
+  id        String             @id @default(cuid())
+  bonusId   String
+  bonus     Bonus              @relation(fields: [bonusId], references: [id], onDelete: Cascade)
+  type      BonusConditionType
+  operator  String             @default("==")
+  value     String
+  params    Json?
+  createdAt DateTime           @default(now())
+
+  @@index([bonusId])
+}
+
+// A player's instance of a granted bonus — the live wagering ledger anchor.
+model UserBonus {
+  id      String          @id @default(cuid())
+  userId  String
+  user    User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bonusId String
+  bonus   Bonus           @relation(fields: [bonusId], references: [id])
+  status  UserBonusStatus @default(PENDING)
+
+  grantedAmountMinor  BigInt  @default(0)
+  triggerAmountMinor  BigInt  @default(0)
+  wagerRequiredMinor  BigInt  @default(0)
+  wagerProgressMinor  BigInt  @default(0)
+  maxConvertibleMinor BigInt?
+  releasedAmountMinor BigInt  @default(0)
+
+  activatedAt DateTime?
+  expiresAt   DateTime?
+  completedAt DateTime?
+
+  grantKey String? @unique
+
+  metadata  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  wagerRequirement BonusWagerRequirement?
+  contributions    WagerContribution[]
+  freeSpinAwards   FreeSpinAward[]
+  auditLogs        BonusAuditLog[]
+
+  @@index([userId, status])
+  @@index([bonusId])
+  @@index([status])
+  @@index([expiresAt])
+}
+
+// Wagering rule snapshot for a UserBonus (captured at grant time).
+model BonusWagerRequirement {
+  id              String    @id @default(cuid())
+  userBonusId     String    @unique
+  userBonus       UserBonus @relation(fields: [userBonusId], references: [id], onDelete: Cascade)
+  multiplier      Float
+  baseAmountMinor BigInt
+  requiredMinor   BigInt
+  progressMinor   BigInt    @default(0)
+  maxBetMinor     BigInt?
+  categoryWeights Json?
+  expiresAt       DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+}
+
+// One wagering contribution (a settled bet applied to a UserBonus).
+model WagerContribution {
+  id               String    @id @default(cuid())
+  userBonusId      String
+  userBonus        UserBonus @relation(fields: [userBonusId], references: [id], onDelete: Cascade)
+  sourceType       String
+  sourceRef        String
+  stakeMinor       BigInt
+  weight           Float     @default(1)
+  contributedMinor BigInt
+  createdAt        DateTime  @default(now())
+
+  @@unique([userBonusId, sourceRef])
+  @@index([userBonusId])
+}
+
+// A free-spin award (may belong to a UserBonus or stand alone).
+model FreeSpinAward {
+  id             String     @id @default(cuid())
+  userId         String
+  user           User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userBonusId    String?
+  userBonus      UserBonus? @relation(fields: [userBonusId], references: [id], onDelete: SetNull)
+  gameId         String?
+  totalSpins     Int
+  usedSpins      Int        @default(0)
+  spinValueMinor BigInt
+  winningsMinor  BigInt     @default(0)
+  status         String     @default("ACTIVE")
+  expiresAt      DateTime?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  @@index([userId, status])
+}
+
+// A marketing promotion: wraps a Bonus with display/landing metadata + schedule.
+model Promotion {
+  id          String          @id @default(cuid())
+  slug        String          @unique
+  title       String
+  subtitle    String?
+  description String?
+  bannerUrl   String?
+  bonusId     String?
+  bonus       Bonus?          @relation(fields: [bonusId], references: [id], onDelete: SetNull)
+  status      PromotionStatus @default(DRAFT)
+  sortOrder   Int             @default(0)
+  content     Json?
+  startsAt    DateTime?
+  endsAt      DateTime?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@index([status])
+}
+
+// Immutable audit trail for every bonus-affecting action.
+model BonusAuditLog {
+  id          String     @id @default(cuid())
+  bonusId     String?
+  bonus       Bonus?     @relation(fields: [bonusId], references: [id], onDelete: SetNull)
+  userBonusId String?
+  userBonus   UserBonus? @relation(fields: [userBonusId], references: [id], onDelete: SetNull)
+  userId      String?
+  actorId     String?
+  action      String
+  amountMinor BigInt?
+  metadata    Json?
+  createdAt   DateTime   @default(now())
+
+  @@index([userBonusId])
+  @@index([bonusId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+// Bonus-abuse signal raised by the anti-abuse engine (IP/device/pattern).
+model BonusAbuseFlag {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bonusId   String?
+  reason    String
+  severity  String   @default("LOW")
+  details   Json?
+  resolved  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([resolved])
+}
+
+// Global, hot-reloadable bonus engine settings (changeable without redeploy).
+model BonusSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+// ──────────────────────────────────────────────
+// Loyalty & VIP Program
+// ──────────────────────────────────────────────
+
+// Point "currency" kinds. LOYALTY points are spendable in the VIP shop and
+// expire; STATUS (XP) points are lifetime/period accumulators that drive tier.
+enum LoyaltyPointType {
+  LOYALTY // redeemable, can expire
+  STATUS // tier XP — drives level up/down (period-scoped)
+}
+
+// Source of a point movement, for audit + analytics.
+enum LoyaltyPointSource {
+  BET
+  DEPOSIT
+  WIN_BIG
+  MISSION
+  LEVEL_UP
+  BIRTHDAY
+  MANUAL_ADJUST
+  REDEMPTION
+  EXPIRY
+  PROMO
+}
+
+enum MissionType {
+  DAILY
+  WEEKLY
+  MONTHLY
+  ACHIEVEMENT // permanent, one-off
+  TIER // unlocked at a given VIP tier
+}
+
+// What a mission measures. Progress is incremented by matching events.
+enum MissionMetric {
+  BET_COUNT
+  BET_AMOUNT // turnover in minor units
+  DEPOSIT_AMOUNT
+  WIN_AMOUNT
+  LOGIN_STREAK
+  GAME_CATEGORY_BETS // bets in a specific category (params.category)
+  POINTS_EARNED
+}
+
+enum MissionStatus {
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+enum UserMissionStatus {
+  IN_PROGRESS
+  COMPLETED // target reached, reward unclaimed
+  CLAIMED // reward granted
+  EXPIRED
+}
+
+enum VipShopItemType {
+  FREE_SPINS
+  BONUS_MONEY
+  CASHBACK_BOOST
+  PHYSICAL // gadget / merch (manual fulfilment)
+  CUSTOM
+}
+
+enum RedemptionStatus {
+  PENDING // awaiting fulfilment (physical items)
+  FULFILLED
+  CANCELLED
+  REFUNDED
+}
+
+enum VipBenefitType {
+  CASHBACK_PCT // percentage cashback
+  BONUS_BOOST_PCT // +% on bonus credits
+  WITHDRAWAL_LIMIT // daily withdrawal cap (minor units)
+  WITHDRAWAL_SPEED // hours to process
+  POINT_MULTIPLIER // ×multiplier on point accrual
+  DEDICATED_MANAGER // boolean perk
+  BIRTHDAY_GIFT // minor-unit gift
+  FREE_WITHDRAWALS // count per period
+  CUSTOM
+}
+
+// A VIP tier. Ordering by `level` (0 = lowest). requiredPoints is the cumulative
+// STATUS points needed to reach this tier; keepPoints is the floor to stay (used
+// by the downgrade grace logic).
+model VipLevel {
+  id               String   @id @default(cuid())
+  level            Int      @unique // 0..N ordering
+  name             String   @unique // Bronze, Silver, …
+  color            String? // UI accent (hex)
+  icon             String? // UI icon key
+  requiredPoints   BigInt   @default(0) // cumulative STATUS points to reach
+  keepPoints       BigInt   @default(0) // floor to retain (per review period)
+  // Base point multiplier granted by simply being at this tier.
+  pointMultiplier  Float    @default(1)
+  // Convenience perks surfaced directly (also expressible via VipBenefit rows).
+  cashbackPct      Float    @default(0)
+  weeklyBonusMinor BigInt   @default(0)
+  // Free-form extra config (perk copy, thresholds…) — configurable w/o migration.
+  config           Json?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  tierBenefits VipTierBenefit[]
+  progress     VipProgress[]
+  missions     Mission[]
+
+  @@index([level])
+}
+
+// A reusable benefit definition. Linked to tiers via VipTierBenefit (m-to-m)
+// so the same benefit type can carry a different value per tier.
+model VipBenefit {
+  id          String         @id @default(cuid())
+  key         String         @unique // stable code, e.g. "cashback", "fast_withdraw"
+  name        String
+  description String?
+  type        VipBenefitType
+  // Default value (overridable per tier in VipTierBenefit.value).
+  unit        String? // "%", "USD", "hours", "bool"…
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  tierBenefits VipTierBenefit[]
+}
+
+// Many-to-many join carrying the per-tier value of a benefit.
+model VipTierBenefit {
+  id         String     @id @default(cuid())
+  levelId    String
+  level      VipLevel   @relation(fields: [levelId], references: [id], onDelete: Cascade)
+  benefitId  String
+  benefit    VipBenefit @relation(fields: [benefitId], references: [id], onDelete: Cascade)
+  // Numeric value (e.g. 5 for 5% cashback, 50000 for $500 limit). For boolean
+  // perks, 1 = enabled. Snapshot copy of unit for convenience.
+  value      Float      @default(0)
+  valueMinor BigInt? // when the benefit is a money amount
+  enabled    Boolean    @default(true)
+  createdAt  DateTime   @default(now())
+
+  @@unique([levelId, benefitId])
+  @@index([levelId])
+}
+
+// One row per user: their current tier + point balances + review window state.
+// loyaltyPoints = redeemable balance; statusPoints = tier XP this period;
+// lifetimePoints = all-time STATUS earned (never decremented).
+model VipProgress {
+  id                      String    @id @default(cuid())
+  userId                  String    @unique
+  user                    User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  levelId                 String
+  level                   VipLevel  @relation(fields: [levelId], references: [id])
+  loyaltyPoints           BigInt    @default(0)
+  statusPoints            BigInt    @default(0)
+  lifetimePoints          BigInt    @default(0)
+  // Optimistic-lock version (point mutations bump this).
+  version                 Int       @default(0)
+  // Downgrade grace: when statusPoints fell below keepPoints, we start a grace
+  // window; if not recovered by graceEndsAt, the tier is reduced.
+  graceEndsAt             DateTime?
+  pendingDowngradeLevelId String?
+  // Period boundaries for STATUS accrual (rolling review).
+  periodStartedAt         DateTime  @default(now())
+  lastLevelUpAt           DateTime?
+  lastActivityAt          DateTime?
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  @@index([levelId])
+}
+
+// Immutable point ledger. Every accrual / spend / expiry / adjustment is a row,
+// so balances are always reconcilable (mirrors the wallet Transaction ledger).
+model LoyaltyPointTransaction {
+  id           String             @id @default(cuid())
+  userId       String
+  user         User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type         LoyaltyPointType
+  source       LoyaltyPointSource
+  // Signed amount (+earn / -spend|expire).
+  amount       BigInt
+  balanceAfter BigInt
+  // Idempotency anchor (e.g. `bet:<roundId>`); makes replays safe.
+  reference    String?            @unique
+  metadata     Json?
+  createdAt    DateTime           @default(now())
+
+  @@index([userId, createdAt])
+  @@index([type])
+  @@index([source])
+}
+
+// A mission/challenge template (admin-configured). target is the metric goal;
+// reward is paid in loyalty/status points (and/or a linked bonus via config).
+model Mission {
+  id                 String        @id @default(cuid())
+  key                String        @unique
+  name               String
+  description        String?
+  type               MissionType
+  metric             MissionMetric
+  status             MissionStatus @default(ACTIVE)
+  target             BigInt // goal value for the metric
+  rewardPoints       BigInt        @default(0) // loyalty points on completion
+  rewardStatusPoints BigInt        @default(0) // tier XP on completion
+  rewardBonusId      String? // optional bonus template granted on claim
+  // Tier gating (for TIER missions) + ordering.
+  minLevelId         String?
+  minLevel           VipLevel?     @relation(fields: [minLevelId], references: [id], onDelete: SetNull)
+  sortOrder          Int           @default(0)
+  // Repeat window in hours for DAILY/WEEKLY/MONTHLY (defaulted by type).
+  resetHours         Int?
+  // Extra params (e.g. {"category":"SLOTS"} for GAME_CATEGORY_BETS).
+  params             Json?
+  startsAt           DateTime?
+  endsAt             DateTime?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  userMissions UserMission[]
+
+  @@index([type])
+  @@index([status])
+}
+
+// A user's live progress on a mission for the current period. periodKey scopes
+// recurring missions (e.g. "2026-06-17" for daily) so each period is a fresh row.
+model UserMission {
+  id          String            @id @default(cuid())
+  userId      String
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  missionId   String
+  mission     Mission           @relation(fields: [missionId], references: [id], onDelete: Cascade)
+  status      UserMissionStatus @default(IN_PROGRESS)
+  progress    BigInt            @default(0)
+  target      BigInt // snapshot of mission target at start
+  periodKey   String // scopes recurring missions; "ALL" for achievements
+  completedAt DateTime?
+  claimedAt   DateTime?
+  expiresAt   DateTime?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  // One active row per (user, mission, period).
+  @@unique([userId, missionId, periodKey])
+  @@index([userId, status])
+  @@index([missionId])
+}
+
+// A redeemable VIP-shop item. stock = null → unlimited; otherwise decremented
+// atomically on redemption.
+model VipShopItem {
+  id          String          @id @default(cuid())
+  sku         String          @unique
+  name        String
+  description String?
+  imageUrl    String?
+  type        VipShopItemType
+  costPoints  BigInt // loyalty points to redeem
+  // Payload describing what the player receives (free spins count, bonus id…).
+  payload     Json?
+  // Optional money value (bonus money / cashback amount) in minor units.
+  valueMinor  BigInt?
+  stock       Int? // null = unlimited
+  minLevel    Int             @default(0) // min VIP level to purchase
+  enabled     Boolean         @default(true)
+  sortOrder   Int             @default(0)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  redemptions RedemptionHistory[]
+
+  @@index([enabled])
+}
+
+// Audit + fulfilment record for every VIP-shop redemption.
+model RedemptionHistory {
+  id         String           @id @default(cuid())
+  userId     String
+  user       User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  itemId     String
+  item       VipShopItem      @relation(fields: [itemId], references: [id])
+  costPoints BigInt
+  status     RedemptionStatus @default(PENDING)
+  // Idempotency for the spend (prevents double-charge on retries).
+  reference  String           @unique
+  // Link to whatever was granted (bonus id, free-spin award id…).
+  grantedRef String?
+  metadata   Json?
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([status])
+}
+
+// Global, hot-reloadable loyalty engine settings (point rates, anti-abuse,
+// downgrade policy) — changeable WITHOUT redeploy. Key/value like BonusSetting.
+model LoyaltySetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}

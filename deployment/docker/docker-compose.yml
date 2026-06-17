@@ -1,0 +1,216 @@
+# Casino Clone — production compose.
+# Run from repo root:  docker compose -f deployment/docker/docker-compose.yml up -d --build
+# Env is read from deployment/.env (see deployment/.env.example).
+
+name: casino
+
+# ── Reusable fragments ──────────────────────────────────────
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '5'
+
+x-common-env: &common-env
+  NODE_ENV: production
+  DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+  REDIS_URL: redis://redis:6379
+  JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
+  JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+  CORS_ORIGINS: ${CORS_ORIGINS}
+  GATEWAY_SECRET: ${GATEWAY_SECRET}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+# The Node image is built once and reused by every service (cache hits make the
+# repeated build blocks instant).
+x-node-build: &node-build
+  context: ../..
+  dockerfile: deployment/docker/Dockerfile.backend
+
+x-node-healthcheck: &node-healthcheck
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 25s
+
+services:
+  # ── Data stores ───────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../scripts/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *logging
+
+  # ── One-shot schema sync + seed (runs, then exits) ────────
+  migrate:
+    image: casino/node-services:latest
+    build: *node-build
+    command: >
+      sh -c "npx prisma db push --schema backend/prisma/schema.prisma --skip-generate &&
+             (npx tsx backend/prisma/seed.ts || echo 'seed skipped')"
+    environment:
+      <<: *common-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+    logging: *logging
+
+  # ── Microservices (all from the same image, different command) ─
+  auth-service:
+    image: casino/node-services:latest
+    build: *node-build
+    command: ['node', 'auth-service/dist/index.js']
+    environment:
+      <<: *common-env
+      AUTH_PORT: '4001'
+    expose: ['4001']
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      <<: *node-healthcheck
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:4001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    restart: unless-stopped
+    logging: *logging
+
+  wallet-service:
+    image: casino/node-services:latest
+    build: *node-build
+    command: ['node', 'wallet-service/dist/index.js']
+    environment:
+      <<: *common-env
+      WALLET_PORT: '4002'
+    expose: ['4002']
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      <<: *node-healthcheck
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:4002/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    restart: unless-stopped
+    logging: *logging
+
+  backend:
+    image: casino/node-services:latest
+    build: *node-build
+    command: ['node', 'backend/dist/index.js']
+    environment:
+      <<: *common-env
+      BACKEND_PORT: '4000'
+    expose: ['4000']
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      <<: *node-healthcheck
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    restart: unless-stopped
+    logging: *logging
+
+  api-gateway:
+    image: casino/node-services:latest
+    build: *node-build
+    command: ['node', 'api-gateway/dist/index.js']
+    environment:
+      <<: *common-env
+      GATEWAY_PORT: '8080'
+      AUTH_SERVICE_URL: http://auth-service:4001
+      WALLET_SERVICE_URL: http://wallet-service:4002
+      BACKEND_SERVICE_URL: http://backend:4000
+    expose: ['8080']
+    depends_on:
+      auth-service: { condition: service_healthy }
+      wallet-service: { condition: service_healthy }
+      backend: { condition: service_healthy }
+    healthcheck:
+      <<: *node-healthcheck
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    restart: unless-stopped
+    logging: *logging
+
+  # ── Static SPAs (nginx-served) ────────────────────────────
+  frontend:
+    image: casino/frontend:latest
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile.frontend
+      args:
+        APP: frontend
+    expose: ['80']
+    restart: unless-stopped
+    logging: *logging
+
+  admin-panel:
+    image: casino/admin-panel:latest
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile.frontend
+      args:
+        APP: admin-panel
+    expose: ['80']
+    restart: unless-stopped
+    logging: *logging
+
+  # ── Edge: TLS termination + reverse proxy ─────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ../nginx/nginx.conf:/etc/nginx/templates/nginx.conf:ro
+      - ../certs:/etc/nginx/certs:ro
+      - certbot-webroot:/var/www/certbot
+    environment:
+      DOMAIN: ${DOMAIN}
+    # Substitute ONLY $DOMAIN (single-quoted list) so nginx's own $variables are
+    # left intact, then start nginx in the foreground.
+    command:
+      - /bin/sh
+      - -c
+      - envsubst '$$DOMAIN' < /etc/nginx/templates/nginx.conf > /etc/nginx/nginx.conf && exec nginx -g 'daemon off;'
+    depends_on:
+      - frontend
+      - admin-panel
+      - api-gateway
+      - backend
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1/healthz']
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    logging: *logging
+
+volumes:
+  pgdata:
+  redisdata:
+  certbot-webroot:

@@ -1,0 +1,65 @@
+# syntax=docker/dockerfile:1
+# Monorepo Node image — contains ALL backend services (auth, wallet, backend,
+# api-gateway) + the game-engine lib + Prisma client. Each compose service runs
+# the same image with a different `command`. Build context = repo root.
+
+# ── Builder ──────────────────────────────────────────────────
+FROM node:20-bookworm-slim AS builder
+WORKDIR /app
+# OpenSSL is required by the Prisma query engine.
+RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install deps first (better layer caching) — copy only manifests.
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY game-engine/package.json game-engine/
+COPY auth-service/package.json auth-service/
+COPY wallet-service/package.json wallet-service/
+COPY backend/package.json backend/
+COPY api-gateway/package.json api-gateway/
+COPY frontend/package.json frontend/
+COPY admin-panel/package.json admin-panel/
+RUN npm ci
+
+# Copy sources and build.
+COPY . .
+RUN npx prisma generate --schema backend/prisma/schema.prisma
+RUN npm run build -w game-engine -w auth-service -w wallet-service -w backend -w api-gateway
+
+# Drop dev dependencies to slim the runtime node_modules (keep prisma/tsx which
+# are needed by the migrate step — they live in backend deps/devDeps, retained
+# via the separate prune below only for prod deps).
+# We keep full node_modules so the one-shot migrate (prisma db push + tsx seed) works.
+
+# ── Runner ───────────────────────────────────────────────────
+FROM node:20-bookworm-slim AS runner
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+ENV NODE_ENV=production
+
+# Workspaces are symlinked inside node_modules; copy the tree wholesale so the
+# @casino/game-engine symlink resolves to /app/game-engine.
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./package.json
+
+COPY --from=builder /app/game-engine/dist ./game-engine/dist
+COPY --from=builder /app/game-engine/package.json ./game-engine/package.json
+COPY --from=builder /app/auth-service/dist ./auth-service/dist
+COPY --from=builder /app/auth-service/package.json ./auth-service/package.json
+COPY --from=builder /app/wallet-service/dist ./wallet-service/dist
+COPY --from=builder /app/wallet-service/package.json ./wallet-service/package.json
+COPY --from=builder /app/backend/dist ./backend/dist
+COPY --from=builder /app/backend/package.json ./backend/package.json
+COPY --from=builder /app/backend/prisma ./backend/prisma
+COPY --from=builder /app/api-gateway/dist ./api-gateway/dist
+COPY --from=builder /app/api-gateway/package.json ./api-gateway/package.json
+
+# Run as the non-root user shipped with the node image.
+USER node
+
+# Documented; the edge nginx is the only externally published port.
+EXPOSE 4000 4001 4002 8080
+
+# Default command (overridden per service in docker-compose).
+CMD ["node", "backend/dist/index.js"]

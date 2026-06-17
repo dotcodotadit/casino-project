@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+# Builds a Vite SPA (frontend OR admin-panel via --build-arg APP=...) and serves
+# the static output with nginx. Build context = repo root.
+
+ARG APP=frontend
+
+# ── Builder ──────────────────────────────────────────────────
+FROM node:20-bookworm-slim AS builder
+ARG APP
+WORKDIR /app
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY game-engine/package.json game-engine/
+COPY auth-service/package.json auth-service/
+COPY wallet-service/package.json wallet-service/
+COPY backend/package.json backend/
+COPY api-gateway/package.json api-gateway/
+COPY frontend/package.json frontend/
+COPY admin-panel/package.json admin-panel/
+RUN npm ci
+
+COPY . .
+# Production API/socket origins are same-origin (the edge nginx proxies /api and
+# /socket.io), which is exactly the app defaults — no build-time URL needed.
+#
+# For the standalone localhost compose (no edge TLS) these are passed so the SPA
+# talks to the gateway/backend on explicit host ports. Empty by default → the app
+# falls back to same-origin '/api' and '/' (the production behaviour).
+ARG VITE_API_URL=""
+ARG VITE_SOCKET_URL=""
+ENV VITE_API_URL=$VITE_API_URL
+ENV VITE_SOCKET_URL=$VITE_SOCKET_URL
+RUN npm run build -w "$APP"
+# Normalize the output path so the runtime stage doesn't need the ARG.
+RUN cp -r "/app/$APP/dist" /app/_dist
+
+# ── Runner (static via nginx) ────────────────────────────────
+FROM nginx:1.27-alpine AS runner
+COPY deployment/nginx/spa.conf /etc/nginx/conf.d/default.conf
+COPY --from=builder /app/_dist /usr/share/nginx/html
+EXPOSE 80
+HEALTHCHECK --interval=20s --timeout=4s --retries=5 \
+  CMD wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1

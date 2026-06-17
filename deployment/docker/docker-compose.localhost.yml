@@ -1,0 +1,210 @@
+# Casino Clone — STANDALONE LOCALHOST compose (for review / quick demo).
+#
+# Unlike docker-compose.yml (production: edge nginx + TLS + domain), this stack
+# has NO edge proxy and NO TLS. Each piece is published directly on a host port
+# so you can open it in a browser immediately — no certs, no /etc/hosts edits,
+# no .env required (sensible demo defaults are inlined below).
+#
+# Run from repo root:
+#   docker compose -f deployment/docker/docker-compose.localhost.yml up -d --build
+#
+# Then open:
+#   Player app   → http://localhost:5173
+#   Admin panel  → http://localhost:5174
+#   API gateway  → http://localhost:8080/api   (404 envelope = reachable)
+#   Backend WS   → http://localhost:4000        (Socket.io)
+#
+# Demo logins (from seed):
+#   player@royalcasino.dev / Player@12345     admin@royalcasino.dev / Admin@12345
+#   admin-panel demo login: admin / admin123
+
+name: casino-local
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: '10m', max-file: '3' }
+
+# Shared env for the Node services. Demo defaults via ${VAR:-default} so the
+# stack runs with zero configuration; override by exporting vars or using
+# --env-file deployment/.env if you want custom secrets.
+x-common-env: &common-env
+  NODE_ENV: production
+  DATABASE_URL: postgresql://${POSTGRES_USER:-casino}:${POSTGRES_PASSWORD:-casino-local-dev}@postgres:5432/${POSTGRES_DB:-casino}?schema=public
+  REDIS_URL: redis://redis:6379
+  # Secrets must be IDENTICAL across services — the single default here guarantees that.
+  JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-local-access-secret-min-32-characters-long-demo}
+  JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-local-refresh-secret-min-32-characters-long-demo}
+  # Browser SPA origins allowed by CORS (gateway + backend socket.io).
+  CORS_ORIGINS: http://localhost:5173,http://localhost:5174
+  # No gateway secret in standalone mode (kept empty = direct access allowed; the
+  # browser still only reaches /api via the gateway and /socket.io via backend).
+  GATEWAY_SECRET: ''
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+x-node-build: &node-build
+  context: ../..
+  dockerfile: deployment/docker/Dockerfile.backend
+
+x-node-healthcheck: &node-healthcheck
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 25s
+
+services:
+  # ── Data stores ───────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-casino}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-casino-local-dev}
+      POSTGRES_DB: ${POSTGRES_DB:-casino}
+    # Exposed to host so you can psql/inspect during review (optional).
+    ports: ['5432:5432']
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../scripts/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-casino} -d ${POSTGRES_DB:-casino}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *logging
+
+  # ── One-shot schema sync + seed (creates ALL tables incl. bonus + loyalty) ──
+  migrate:
+    image: casino/node-services:latest
+    build: *node-build
+    command: >
+      sh -c "npx prisma db push --schema backend/prisma/schema.prisma --skip-generate &&
+             (npx tsx backend/prisma/seed.ts || echo 'seed skipped')"
+    environment:
+      <<: *common-env
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: 'no'
+    logging: *logging
+
+  # ── Microservices (same image, different command) ─────────
+  auth-service:
+    image: casino/node-services:latest
+    build: *node-build
+    command: ['node', 'auth-service/dist/index.js']
+    environment:
+      <<: *common-env
+      AUTH_PORT: '4001'
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      <<: *node-healthcheck
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:4001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    restart: unless-stopped
+    logging: *logging
+
+  wallet-service:
+    image: casino/node-services:latest
+    build: *node-build
+    command: ['node', 'wallet-service/dist/index.js']
+    environment:
+      <<: *common-env
+      WALLET_PORT: '4002'
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      <<: *node-healthcheck
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:4002/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    restart: unless-stopped
+    logging: *logging
+
+  backend:
+    image: casino/node-services:latest
+    build: *node-build
+    command: ['node', 'backend/dist/index.js']
+    environment:
+      <<: *common-env
+      BACKEND_PORT: '4000'
+    # Published so the browser can open the Socket.io connection directly.
+    ports: ['4000:4000']
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      <<: *node-healthcheck
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    restart: unless-stopped
+    logging: *logging
+
+  api-gateway:
+    image: casino/node-services:latest
+    build: *node-build
+    command: ['node', 'api-gateway/dist/index.js']
+    environment:
+      <<: *common-env
+      GATEWAY_PORT: '8080'
+      AUTH_SERVICE_URL: http://auth-service:4001
+      WALLET_SERVICE_URL: http://wallet-service:4002
+      BACKEND_SERVICE_URL: http://backend:4000
+    # The single public REST entrypoint for the SPAs.
+    ports: ['8080:8080']
+    depends_on:
+      auth-service: { condition: service_healthy }
+      wallet-service: { condition: service_healthy }
+      backend: { condition: service_healthy }
+    healthcheck:
+      <<: *node-healthcheck
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    restart: unless-stopped
+    logging: *logging
+
+  # ── Static SPAs (nginx) — built to talk to the host-published gateway/backend ──
+  frontend:
+    image: casino/frontend-local:latest
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile.frontend
+      args:
+        APP: frontend
+        VITE_API_URL: http://localhost:8080/api
+        VITE_SOCKET_URL: http://localhost:4000
+    ports: ['5173:80']
+    depends_on:
+      api-gateway: { condition: service_healthy }
+    restart: unless-stopped
+    logging: *logging
+
+  admin-panel:
+    image: casino/admin-panel-local:latest
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile.frontend
+      args:
+        APP: admin-panel
+        VITE_API_URL: http://localhost:8080/api
+    ports: ['5174:80']
+    depends_on:
+      api-gateway: { condition: service_healthy }
+    restart: unless-stopped
+    logging: *logging
+
+volumes:
+  pgdata:
+  redisdata:

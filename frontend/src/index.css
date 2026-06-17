@@ -1,0 +1,94 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 240 20% 4%;
+    --foreground: 0 0% 98%;
+    --card: 240 18% 8%;
+    --card-foreground: 0 0% 98%;
+    --primary: 51 100% 50%;          /* gold */
+    --primary-foreground: 240 20% 6%;
+    --secondary: 263 70% 50%;        /* royal purple */
+    --secondary-foreground: 0 0% 98%;
+    --muted: 240 12% 16%;
+    --muted-foreground: 240 5% 65%;
+    --accent: 263 70% 50%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 12% 18%;
+    --input: 240 12% 18%;
+    --ring: 51 100% 50%;
+    --radius: 0.75rem;
+    /* Brand accent (drives the `gold` token) — overridden per theme. */
+    --brand: 51 100% 50%;
+    --brand-light: 51 100% 70%;
+    --brand-dark: 45 70% 45%;
+  }
+}
+
+/* ── Theme accents (dark casino) — switched via [data-theme] on <html> ── */
+[data-theme='royal'] {
+  --primary: 263 70% 58%;
+  --ring: 263 70% 58%;
+  --accent: 280 70% 55%;
+  --brand: 263 70% 60%;
+  --brand-light: 263 80% 74%;
+  --brand-dark: 263 60% 48%;
+}
+[data-theme='emerald'] {
+  --primary: 152 65% 45%;
+  --ring: 152 65% 45%;
+  --accent: 168 65% 42%;
+  --brand: 152 60% 48%;
+  --brand-light: 152 65% 62%;
+  --brand-dark: 152 60% 36%;
+}
+[data-theme='crimson'] {
+  --primary: 348 80% 55%;
+  --ring: 348 80% 55%;
+  --accent: 12 80% 55%;
+  --brand: 348 78% 56%;
+  --brand-light: 348 85% 70%;
+  --brand-dark: 348 70% 45%;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: 'rlig' 1, 'calt' 1;
+    background-image:
+      radial-gradient(circle at 20% 0%, hsl(var(--accent) / 0.12), transparent 40%),
+      radial-gradient(circle at 80% 100%, hsl(var(--primary) / 0.08), transparent 40%);
+    background-attachment: fixed;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer utilities {
+  .text-gold-gradient {
+    @apply bg-gradient-to-b from-gold-light to-gold-dark bg-clip-text text-transparent;
+  }
+  .casino-card {
+    @apply rounded-lg border border-border bg-card/80 backdrop-blur-sm;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}

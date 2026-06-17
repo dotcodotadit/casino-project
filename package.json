@@ -1,0 +1,40 @@
+{
+  "name": "casino-project",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Casino Clone — educational/demo full-stack monorepo (provably-fair simulation, no real money)",
+  "license": "MIT",
+  "workspaces": [
+    "frontend",
+    "backend",
+    "game-engine",
+    "wallet-service",
+    "auth-service",
+    "admin-panel",
+    "api-gateway"
+  ],
+  "scripts": {
+    "dev": "concurrently -n gateway,auth,wallet,backend,web -c blue,green,magenta,yellow,cyan \"npm:dev -w api-gateway\" \"npm:dev -w auth-service\" \"npm:dev -w wallet-service\" \"npm:dev -w backend\" \"npm:dev -w frontend\"",
+    "build": "npm run build --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "engine:build": "npm run build -w game-engine",
+    "prisma:generate": "npm run prisma:generate -w backend",
+    "prisma:migrate": "npm run prisma:migrate -w backend",
+    "docker:up": "docker compose -f deployment/docker/docker-compose.yml up -d",
+    "docker:down": "docker compose -f deployment/docker/docker-compose.yml down",
+    "docker:local": "docker compose -f deployment/docker/docker-compose.localhost.yml up -d --build",
+    "docker:local:down": "docker compose -f deployment/docker/docker-compose.localhost.yml down",
+    "docker:local:logs": "docker compose -f deployment/docker/docker-compose.localhost.yml logs -f",
+    "docker:local:reset": "docker compose -f deployment/docker/docker-compose.localhost.yml down -v"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  }
+}
