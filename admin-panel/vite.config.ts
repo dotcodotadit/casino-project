@@ -2,9 +2,9 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'node:path'
 
-// Admin panel dev server. Shares the gateway proxy convention with the player
-// frontend so future API calls (/api/*) reach the api-gateway on :8080.
+// The unified demo container serves the admin SPA below /admin/.
 export default defineConfig({
+  base: '/admin/',
   plugins: [react()],
   resolve: {
     alias: {
