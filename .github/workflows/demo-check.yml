@@ -1,0 +1,27 @@
+name: Demo branch build check
+
+on:
+  push:
+    branches: [ethio-demo-deploy]
+  pull_request:
+    branches: [ethio-demo-deploy]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Generate Prisma client
+        run: npm run prisma:generate
+      - name: Build game engine
+        run: npm run engine:build
+      - name: Build all applications and services
+        run: npm run build
