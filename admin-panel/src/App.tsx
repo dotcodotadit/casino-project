@@ -22,7 +22,7 @@ import VipShopAdmin from '@/pages/loyalty/VipShopAdmin'
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter basename="/admin">
       <Routes>
         <Route path="/login" element={<Login />} />
         <Route
