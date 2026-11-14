@@ -4,7 +4,7 @@ FROM node:20-bookworm-slim
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    nginx supervisor openssl ca-certificates netcat-openbsd \
+    nginx supervisor openssl ca-certificates netcat-openbsd gettext-base \
   && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json tsconfig.base.json ./
